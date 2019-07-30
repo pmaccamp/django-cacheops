@@ -3,7 +3,6 @@ import sys
 import json
 import threading
 import six
-from random import random
 from funcy import select_keys, cached_property, once, once_per, monkey, wraps, walk, chain
 from funcy.py3 import lmap, map, lcat, join_with
 from .cross import pickle, md5
@@ -33,18 +32,15 @@ _local_get_cache = {}
 
 
 @handle_connection_failure
-def cache_thing(prefix, cache_key, data, cond_dnfs, timeout, dbs=(), precall_key=''):
+def cache_thing(prefix, cache_key, data, cond_dnfs, timeout, dbs=()):
     """
     Writes data to cache and creates appropriate invalidators.
-
-    If precall_key is not the empty string, the data will only be cached if the
-    precall_key is set to avoid caching stale data.
     """
     # Could have changed after last check, sometimes superficially
     if transaction_states.is_dirty(dbs):
         return
     load_script('cache_thing', settings.CACHEOPS_LRU)(
-        keys=[prefix, cache_key, precall_key],
+        keys=[prefix, cache_key],
         args=[
             pickle.dumps(data, -1),
             json.dumps(cond_dnfs, default=str),
@@ -57,16 +53,11 @@ def cached_as(*samples, **kwargs):
     """
     Caches results of a function and invalidates them same way as given queryset(s).
     NOTE: Ignores queryset cached ops settings, always caches.
-
-    If keep_fresh is True, this will prevent caching if the given querysets are
-    invalidated during the function call. This prevents prolonged caching of
-    stale data.
     """
     timeout = kwargs.pop('timeout', None)
     extra = kwargs.pop('extra', None)
     key_func = kwargs.pop('key_func', func_cache_key)
     lock = kwargs.pop('lock', None)
-    keep_fresh = kwargs.pop('keep_fresh', False)
     if not samples:
         raise TypeError('Pass a queryset, a model or an object to cache like')
     if kwargs:
@@ -113,25 +104,8 @@ def cached_as(*samples, **kwargs):
                 if cache_data is not None:
                     return pickle.loads(cache_data)
                 else:
-                    if keep_fresh:
-                        # We call this "asp" for "as precall" because this key is
-                        # cached before the actual function is called. We randomize
-                        # the key to prevent falsely thinking the key was not
-                        # invalidated when in fact it was invalidated and the
-                        # function was called again in another process.
-                        suffix = key_func(func, args, kwargs, key_extra + [random()])
-                        precall_key = prefix + 'asp:' + suffix
-                        # Cache a precall_key to watch for invalidation during
-                        # the function call. Its value does not matter. If and
-                        # only if it remains valid before, during, and after the
-                        # call, the result can be cached and returned.
-                        cache_thing(prefix, precall_key, 'PRECALL', cond_dnfs, timeout, dbs=dbs)
-                    else:
-                        precall_key = ''
-
                     result = func(*args, **kwargs)
-                    cache_thing(prefix, cache_key, result, cond_dnfs, timeout, dbs=dbs,
-                                precall_key=precall_key)
+                    cache_thing(prefix, cache_key, result, cond_dnfs, timeout, dbs=dbs)
                     return result
 
         return wrapper
@@ -216,7 +190,7 @@ class QuerySetMixin(object):
     def cache(self, ops=None, timeout=None, lock=None):
         """
         Enables caching for given ops
-            ops        - a subset of {'get', 'fetch', 'count', 'exists', 'aggregate'},
+            ops        - a subset of {'get', 'fetch', 'count', 'exists'},
                          ops caching to be turned on, all enabled by default
             timeout    - override default cache timeout
             lock       - use lock to prevent dog-pile effect
@@ -571,37 +545,7 @@ def install_cacheops():
     """
     Installs cacheops by numerous monkey patches
     """
-    monkey_mix(Manager, ManagerMixin)
     monkey_mix(QuerySet, QuerySetMixin)
-
-    # Use app registry to introspect used apps
-    from django.apps import apps
-
-    # Install profile and signal handlers for any earlier created models
-    for model in apps.get_models(include_auto_created=True):
-        if family_has_profile(model):
-            if not isinstance(model._default_manager, Manager):
-                raise ImproperlyConfigured("Can't install cacheops for %s.%s model:"
-                                           " non-django model class or manager is used."
-                                            % (model._meta.app_label, model._meta.model_name))
-            model._default_manager._install_cacheops(model)
-
-            # Bind m2m changed handlers
-            rel_attr = 'remote_field' if django.VERSION >= (1, 9) else 'rel'
-            m2ms = (f for f in model._meta.get_fields(include_hidden=True) if f.many_to_many)
-            for m2m in m2ms:
-                rel = m2m if hasattr(m2m, 'through') else getattr(m2m, rel_attr, m2m)
-                opts = rel.through._meta
-                m2m_changed.connect(invalidate_m2m, sender=rel.through,
-                                    dispatch_uid=(opts.app_label, opts.model_name))
-
-    # Turn off caching in admin
-    if apps.is_installed('django.contrib.admin'):
-        from django.contrib.admin.options import ModelAdmin
-
-        @monkey(ModelAdmin)
-        def get_queryset(self, request):
-            return get_queryset.original(self, request).nocache()
 
     # Make buffers/memoryviews pickleable to serialize binary field data
     if six.PY2:
